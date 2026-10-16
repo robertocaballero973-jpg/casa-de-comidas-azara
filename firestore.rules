@@ -1,0 +1,259 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function verified() {
+      return signedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isAdmin() {
+      return verified()
+        && request.auth.token.email == 'robertocaballero973@gmail.com';
+    }
+
+    function owns(businessId) {
+      return verified()
+        && exists(/databases/$(database)/documents/foodMembers/$(request.auth.uid))
+        && get(/databases/$(database)/documents/foodMembers/$(request.auth.uid)).data.businessId == businessId
+        && get(/databases/$(database)/documents/foodMembers/$(request.auth.uid)).data.ownerUid == request.auth.uid;
+    }
+
+    function activeBusiness(businessId) {
+      return exists(/databases/$(database)/documents/foodBusinesses/$(businessId))
+        && get(/databases/$(database)/documents/foodBusinesses/$(businessId)).data.active == true;
+    }
+
+    function validOrderCounterUpdate(businessId) {
+      let oldDate = ('ordersDate' in resource.data) ? resource.data.ordersDate : '';
+      let oldCount = ('ordersToday' in resource.data) ? resource.data.ordersToday : 0;
+      let limit = ('dailyLimit' in resource.data) ? resource.data.dailyLimit : 10;
+      let newDate = request.resource.data.ordersDate;
+      let newCount = request.resource.data.ordersToday;
+      let orderId = request.resource.data.lastOrderId;
+      return request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['ordersDate','ordersToday','lastOrderId'])
+        && newDate is string
+        && newCount is int
+        && newCount == (newDate == oldDate ? oldCount + 1 : 1)
+        && newCount <= limit
+        && orderId is string
+        && resource.data.active == true
+        && (!('acceptingOrders' in resource.data) || resource.data.acceptingOrders == true)
+        && existsAfter(/databases/$(database)/documents/foodOrders/$(orderId))
+        && getAfter(/databases/$(database)/documents/foodOrders/$(orderId)).data.businessId == businessId
+        && getAfter(/databases/$(database)/documents/foodOrders/$(orderId)).data.status == 'nuevo'
+        && getAfter(/databases/$(database)/documents/foodOrders/$(orderId)).data.createdAt == request.time;
+    }
+
+    // Alta de local, miembro, control y contador en una sola transacción.
+    function validRegistrationBatch(businessId) {
+      let before = exists(/databases/$(database)/documents/foodMeta/pilot)
+        ? get(/databases/$(database)/documents/foodMeta/pilot).data.count
+        : 0;
+      return verified()
+        && existsAfter(/databases/$(database)/documents/foodMembers/$(request.auth.uid))
+        && getAfter(/databases/$(database)/documents/foodMembers/$(request.auth.uid)).data.businessId == businessId
+        && getAfter(/databases/$(database)/documents/foodMembers/$(request.auth.uid)).data.ownerUid == request.auth.uid
+        && existsAfter(/databases/$(database)/documents/foodBusinesses/$(businessId))
+        && getAfter(/databases/$(database)/documents/foodBusinesses/$(businessId)).data.ownerUid == request.auth.uid
+        && getAfter(/databases/$(database)/documents/foodMeta/pilot).data.count == before + 1
+        && before < 7;
+    }
+
+    function validBusinessProfile(d) {
+      return d.keys().hasOnly([
+          'name','slug','address','whatsapp','hours','active','acceptingOrders',
+          'dailyLimit','ordersToday','ordersDate','lastOrderId','ownerUid','createdAt'
+        ])
+        && d.name is string
+        && d.name.size() >= 2
+        && d.name.size() <= 100
+        && d.slug is string
+        && d.slug.size() >= 3
+        && d.slug.size() <= 60
+        && d.address is string
+        && d.whatsapp is string
+        && d.hours is string
+        && d.active is bool
+        && d.acceptingOrders is bool
+        && d.dailyLimit is int
+        && d.dailyLimit >= 1
+        && d.dailyLimit <= 100
+        && d.ordersToday is int
+        && d.ordersToday == 0
+        && d.ordersDate is string
+        && d.lastOrderId is string
+        && d.ownerUid is string;
+    }
+
+    match /foodMeta/pilot {
+      function registrationBatchFromMember() {
+        return existsAfter(/databases/$(database)/documents/foodMembers/$(request.auth.uid))
+          && validRegistrationBatch(
+            getAfter(/databases/$(database)/documents/foodMembers/$(request.auth.uid)).data.businessId
+          );
+      }
+
+      allow get: if true;
+      allow list: if false;
+
+      allow create: if verified()
+        && request.resource.data.keys().hasOnly(['count','updatedAt'])
+        && request.resource.data.count == 1
+        && registrationBatchFromMember();
+
+      allow update: if verified()
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['count','updatedAt'])
+        && resource.data.count < 7
+        && request.resource.data.count == resource.data.count + 1
+        && registrationBatchFromMember();
+
+      allow delete: if isAdmin();
+    }
+
+    match /foodBusinesses/{businessId} {
+      allow get, list: if isAdmin()
+        || resource.data.active == true
+        || owns(businessId);
+
+      allow create: if validBusinessProfile(request.resource.data)
+        && request.resource.data.slug == businessId
+        && request.resource.data.active == true
+        && request.resource.data.ownerUid == request.auth.uid
+        && validRegistrationBatch(businessId);
+
+      allow update: if isAdmin()
+        || (owns(businessId)
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['name','address','whatsapp','hours','acceptingOrders','dailyLimit'])
+          && request.resource.data.ownerUid == resource.data.ownerUid
+          && request.resource.data.active == resource.data.active
+          && request.resource.data.acceptingOrders is bool
+          && request.resource.data.dailyLimit is int
+          && request.resource.data.dailyLimit >= 1
+          && request.resource.data.dailyLimit <= 100)
+        || validOrderCounterUpdate(businessId);
+
+      allow delete: if false;
+    }
+
+    match /foodMembers/{uid} {
+      allow get, list: if isAdmin()
+        || (verified() && request.auth.uid == uid);
+
+      allow create: if verified()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly([
+          'businessId','ownerUid','email','createdAt'
+        ])
+        && request.resource.data.ownerUid == uid
+        && request.resource.data.email == request.auth.token.email
+        && validRegistrationBatch(request.resource.data.businessId);
+
+      allow update, delete: if false;
+    }
+
+    match /foodControl/{businessId} {
+      allow get, list: if isAdmin();
+
+      allow create: if verified()
+        && request.resource.data.keys().hasOnly([
+          'businessId','email','registeredAt','dueDate','suspended','updatedAt'
+        ])
+        && request.resource.data.businessId == businessId
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.dueDate == null
+        && request.resource.data.suspended == false
+        && validRegistrationBatch(businessId);
+
+      allow update, delete: if isAdmin();
+    }
+
+    match /foodMenuItems/{itemId} {
+      allow get, list: if isAdmin()
+        || owns(resource.data.businessId)
+        || activeBusiness(resource.data.businessId);
+
+      allow create: if verified()
+        && request.resource.data.keys().hasOnly([
+          'businessId','ownerUid','name','category','description','price',
+          'order','photoKey','active','createdAt','updatedAt'
+        ])
+        && request.resource.data.ownerUid == request.auth.uid
+        && owns(request.resource.data.businessId)
+        && request.resource.data.name is string
+        && request.resource.data.price is number
+        && request.resource.data.price >= 0
+        && request.resource.data.photoKey in [
+          'hamburguesa','milanesa','empanadas','pizza','papas','lomito'
+        ];
+
+      allow update: if verified()
+        && owns(resource.data.businessId)
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && request.resource.data.businessId == resource.data.businessId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'name','category','description','price','order','photoKey','active','updatedAt'
+        ])
+        && request.resource.data.price is number
+        && request.resource.data.price >= 0
+        && request.resource.data.photoKey in [
+          'hamburguesa','milanesa','empanadas','pizza','papas','lomito'
+        ];
+
+      allow delete: if owns(resource.data.businessId);
+    }
+
+    match /foodOrders/{orderId} {
+      allow get, list: if isAdmin() || owns(resource.data.businessId);
+
+      allow create: if request.resource.data.keys().hasOnly([
+          'businessId','orderCode','customerName','customerPhone','mode',
+          'address','note','items','total','status','createdAt'
+        ])
+        && request.resource.data.businessId is string
+        && activeBusiness(request.resource.data.businessId)
+        && request.resource.data.orderCode is string
+        && request.resource.data.customerName is string
+        && request.resource.data.customerName.size() >= 2
+        && request.resource.data.customerPhone is string
+        && request.resource.data.customerPhone.size() >= 6
+        && request.resource.data.mode in ['envio','retiro']
+        && request.resource.data.address is string
+        && (request.resource.data.mode == 'retiro'
+          || request.resource.data.address.size() >= 4)
+        && request.resource.data.note is string
+        && request.resource.data.items is list
+        && request.resource.data.items.size() > 0
+        && request.resource.data.items.size() <= 50
+        && request.resource.data.total is number
+        && request.resource.data.total >= 0
+        && request.resource.data.status == 'nuevo'
+        && request.resource.data.createdAt == request.time
+        && getAfter(/databases/$(database)/documents/foodBusinesses/$(request.resource.data.businessId)).data.lastOrderId == orderId
+        && getAfter(/databases/$(database)/documents/foodBusinesses/$(request.resource.data.businessId)).data.ordersToday is int
+        && getAfter(/databases/$(database)/documents/foodBusinesses/$(request.resource.data.businessId)).data.ordersDate is string
+        && (!('acceptingOrders' in getAfter(/databases/$(database)/documents/foodBusinesses/$(request.resource.data.businessId)).data)
+          || getAfter(/databases/$(database)/documents/foodBusinesses/$(request.resource.data.businessId)).data.acceptingOrders == true)
+        && getAfter(/databases/$(database)/documents/foodBusinesses/$(request.resource.data.businessId)).data.ordersToday <= (('dailyLimit' in getAfter(/databases/$(database)/documents/foodBusinesses/$(request.resource.data.businessId)).data)
+          ? getAfter(/databases/$(database)/documents/foodBusinesses/$(request.resource.data.businessId)).data.dailyLimit : 10);
+
+      allow update: if owns(resource.data.businessId)
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status'])
+        && request.resource.data.status in [
+          'nuevo','preparando','listo','entregado','cancelado'
+        ];
+
+      allow delete: if isAdmin();
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
